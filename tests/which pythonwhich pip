@@ -1,0 +1,19 @@
+import time
+from appium import webdriver
+
+def test_android_settings_opens():
+    caps = {
+        "platformName": "Android",
+        "automationName": "UiAutomator2",
+        "deviceName": "Android Emulator",
+        "appPackage": "com.android.settings",  # built-in Android Settings app
+        "appActivity": ".Settings",
+    }
+
+    driver = webdriver.Remote("http://127.0.0.1:4723/wd/hub", caps)
+    time.sleep(2)  # wait for the app to load
+
+    # Quick smoke check: confirm UI is returned
+    assert "<hierarchy" in driver.page_source
+
+    driver.quit()

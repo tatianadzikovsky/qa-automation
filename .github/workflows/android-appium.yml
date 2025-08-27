@@ -1,0 +1,93 @@
+name: Android Appium Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+jobs:
+  e2e:
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java (JDK 17)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pytest pytest-html appium-python-client requests
+          fi
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install Appium + driver
+        run: |
+          npm i -g appium
+          appium -v
+          appium driver install uiautomator2
+          appium driver list
+
+      - name: Start Appium
+        run: |
+          mkdir -p logs
+          appium --log logs/appium.log & echo $! > appium.pid
+          for i in {1..30}; do
+            nc -z 127.0.0.1 4723 && echo "Appium is up" && break
+            echo "Waiting for Appium..." && sleep 2
+          done
+
+      - name: Launch Android emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 33
+          arch: x86_64
+          target: google_apis
+          profile: Pixel_5
+          avd-name: e2e-avd
+          emulator-options: -no-snapshot -noaudio -no-boot-anim -gpu swiftshader_indirect
+          script: echo "Emulator booted"
+
+      - name: Run tests
+        env:
+          PYTHONWARNINGS: ignore::DeprecationWarning
+        run: |
+          mkdir -p screenshots
+          python -m pytest -v --html=report.html --self-contained-html
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-report
+          path: |
+            report.html
+            screenshots/**
+            logs/appium.log
+
+      - name: Stop Appium
+        if: always()
+        run: |
+          if [ -f appium.pid ]; then kill -9 "$(cat appium.pid)" || true; fi
