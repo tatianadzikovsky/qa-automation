@@ -13,61 +13,85 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      # 1) Checkout your repo
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2) Java for Android tools
+      # Java for Android build tools & emulator runner
       - name: Set up Java (JDK 17)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      # 3) Python for pytest
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-
-      # 4) Node.js to install Appium
+      # Node is needed for Appium (npm)
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "18"
+          node-version: "20"
 
-      # 5) Install Appium + Python deps
-      - name: Install dependencies
+      # Python for pytest + appium python client
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+            path: ~/.cache/pip
+            key: pip-${{ runner.os }}-${{ hashFiles('**/requirements.txt') }}
+            restore-keys: |
+              pip-${{ runner.os }}-
+
+      - name: Install dependencies (Python + Appium 3 + driver)
         run: |
-          npm install -g appium
+          set -euxo pipefail
+
+          # Python deps (pytest, appium-python-client, etc.)
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            # safety net if requirements.txt is missing
+            pip install pytest appium-python-client pytest-html
+          fi
+
+          # Install Appium 3 (fixes your CI error)
+          npm install -g appium@3
+
+          # Show versions for debug
+          node -v
+          npm -v
+          appium -v
+          python -V
+          pip -V
+
+          # Install Android driver for Appium
           appium driver install uiautomator2
 
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+      # Start Appium server in the background and capture logs
+      - name: Start Appium
+        run: |
+          mkdir -p logs
+          nohup appium --base-path /wd/hub > logs/appium.log 2>&1 &
+          echo $! > appium.pid
+          sleep 3
+          pgrep -f appium || (echo "Appium failed to start" && exit 1)
 
-      # 6) Boot an Android emulator and run tests inside it
+      # Launch Android emulator and run tests inside it
       - name: Run on Android emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: 34
+          api-level: 33
           target: google_apis
           arch: x86_64
-          profile: pixel_5
           disable-animations: true
+          emulator-options: -no-snapshot -noaudio -no-boot-anim
           script: |
-            mkdir -p logs screenshots
+            python -m pytest -v -s tests/test_ci_smoke.py \
+              --html=report.html --self-contained-html
 
-            # start Appium in background (no base path because your tests use http://127.0.0.1:4723)
-            appium --log logs/appium.log &
-            APPIUM_PID=$!
-
-            # run only the mobile tests (adjust the -k filter if you want)
-            pytest -v -s -k "appium or settings" --html=report.html --self-contained-html
-
-            # stop Appium
-            kill -9 $APPIUM_PID || true
-
-      # 7) Upload report + screenshots no matter what
+      # Always upload the report and logs, even if tests fail
       - name: Upload test report and screenshots
         if: always()
         uses: actions/upload-artifact@v4
@@ -78,3 +102,10 @@ jobs:
             screenshots/**
             logs/appium.log
 
+      # Always stop Appium if it started
+      - name: Stop Appium
+        if: always()
+        run: |
+          if [ -f appium.pid ]; then
+            kill -9 "$(cat appium.pid)" || true
+          fi
