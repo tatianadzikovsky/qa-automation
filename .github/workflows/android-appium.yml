@@ -1,0 +1,87 @@
+name: Android Appium Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+jobs:
+  e2e:
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java (JDK 17)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest appium-python-client pytest-html
+
+      - name: Clean environment (remove any old Appium 2.x)
+        run: |
+          npm uninstall -g appium || true
+          which appium || true
+          appium --version || true
+
+      - name: Install Appium 3 with NPX
+        run: |
+          npx -y appium@next --version
+          npx -y appium@next driver install uiautomator2
+          npx -y appium@next driver list --installed
+
+      - name: Start Appium (v3) in background
+        run: |
+          mkdir -p logs
+          nohup npx -y appium@next --base-path /wd/hub > logs/appium.log 2>&1 &
+          echo $! > appium.pid
+          sleep 5
+          pgrep -f "node .*appium" || (echo "Appium did not start"; tail -n 50 logs/appium.log; exit 1)
+
+      - name: Run tests on Android emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 33
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          emulator-options: -no-snapshot -noaudio -no-boot-anim
+          script: |
+            python -m pytest -v -s tests/test_ci_smoke.py \
+              --html=report.html --self-contained-html
+
+      - name: Upload test report and screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-report
+          path: |
+            report.html
+            screenshots/**
+            logs/appium.log
+
+      - name: Stop Appium
+        if: always()
+        run: |
+          if [ -f appium.pid ]; then
+            kill -9 "$(cat appium.pid)" || true
+          fi
