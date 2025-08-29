@@ -2,3 +2,8 @@ pytest==8.4.1
 pytest-html==4.1.1
 Appium-Python-Client
 selenium
+
+Appium-Python-Client
+selenium
+pytest
+pytest-html

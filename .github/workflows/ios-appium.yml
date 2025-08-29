@@ -1,0 +1,99 @@
+name: iOS Appium Tests (simulator)
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+jobs:
+  e2e-ios:
+    runs-on: macos-14  # Apple Silicon runners (Xcode 15.x)
+    timeout-minutes: 45
+
+    env:
+      IOS_DEVICE: "iPhone 15"
+      IOS_VERSION: "17.5"
+      APPIUM_SERVER: "http://127.0.0.1:4723"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode and Simulators
+        run: |
+          xcodebuild -version
+          xcrun simctl list devicetypes
+          xcrun simctl list runtimes
+
+      # Node for Appium 2
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Appium 2 + xcuitest driver
+        run: |
+          npm -g i appium
+          appium -v
+          appium driver install xcuitest
+          appium driver list
+
+      # Boot a simulator we can target
+      - name: Boot iOS Simulator
+        id: bootsim
+        shell: bash
+        run: |
+          set -e
+
+          # Pick the first available iPhone 15 device (adjust if you prefer another model)
+          UDID=$(xcrun simctl list devices available | awk -F '[()]' '/iPhone 15/{print $2; exit}')
+          if [ -z "$UDID" ]; then
+            echo "No iPhone 15 pre-created; attempting to create one..."
+            # fall back: create a device if missing (best-effort)
+            RUNTIME=$(xcrun simctl list runtimes | awk -F '[()]' '/iOS 17.5/{print $2; exit}')
+            DEVTYPE="iPhone 15"
+            xcrun simctl create "CI iPhone 15" "$DEVTYPE" "$RUNTIME" >/dev/null
+            UDID=$(xcrun simctl list devices available | awk -F '[()]' '/CI iPhone 15/{print $2; exit}')
+          fi
+
+          echo "Using simulator UDID: $UDID"
+          echo "udid=$UDID" >> $GITHUB_OUTPUT
+
+          # Boot & wait until ready
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+          # make sure SpringBoard is up
+          xcrun simctl status_bar "$UDID" override --time "9:41"
+          xcrun simctl io "$UDID" screenshot bootscreen.png || true
+
+      # Python for tests
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Start Appium server (background)
+        run: |
+          # log to file so we can upload it later
+          nohup appium --log appium.log --base-path / &>/dev/null &
+          # tiny wait to ensure server is ready
+          sleep 5
+
+      - name: Run pytest (iOS)
+        run: |
+          pytest -v -s tests_ios --html=report_ios.html --self-contained-html
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-appium-artifacts
+          path: |
+            report_ios.html
+            appium.log
+            bootscreen.png
