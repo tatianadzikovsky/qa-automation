@@ -10,7 +10,7 @@ on:
 jobs:
   e2e:
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -20,64 +20,57 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: '18'
+
+      - name: Install Appium & drivers
+        run: |
+          npm i -g appium@latest wait-on
+          appium -v
+          appium driver install uiautomator2
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.10'
 
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install pytest appium-python-client pytest-html
+          pip install -r requirements.txt
 
-      - name: Clean environment (remove any old Appium 2.x)
-        run: |
-          npm uninstall -g appium || true
-          which appium || true
-          appium --version || true
+      - name: Prepare artifact folders
+        run: mkdir -p screenshots logs
 
-      - name: Install Appium 3 with NPX
-        run: |
-          npx -y appium@next --version
-          npx -y appium@next driver install uiautomator2
-          npx -y appium@next driver list --installed
-
-      - name: Start Appium (v3) in background
-        run: |
-          mkdir -p logs
-          nohup npx -y appium@next --base-path /wd/hub > logs/appium.log 2>&1 &
-          echo $! > appium.pid
-          sleep 5
-          pgrep -f "node .*appium" || (echo "Appium did not start"; tail -n 50 logs/appium.log; exit 1)
-
-      - name: Run tests on Android emulator
+      # Boots emulator, then runs whatever script we provide
+      - name: Launch emulator and run tests
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: 33
-          target: google_apis
+          api-level: 30
+          target: default
           arch: x86_64
+          profile: pixel_5
+          emulator-options: -no-window -noaudio -no-boot-anim
           disable-animations: true
-          emulator-options: -no-snapshot -noaudio -no-boot-anim
           script: |
-            python -m pytest -v -s tests/test_ci_smoke.py \
-              --html=report.html --self-contained-html
+            adb devices
+            adb wait-for-device
+            # speed up UI
+            adb shell settings put global window_animation_scale 0
+            adb shell settings put global transition_animation_scale 0
+            adb shell settings put global animator_duration_scale 0
 
-      - name: Upload test report and screenshots
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pytest-report
-          path: |
-            report.html
-            screenshots/**
-            logs/appium.log
+            # Start Appium in background and wait for the port
+            appium --allow-cors --log logs/appium.log > logs/appium.console.log 2>&1 &
+            echo $! > appium.pid
+            wait-on tcp:4723 -t 60000
+
+            # Run tests
+            pytest -v -s tests/ --html=report.html --self-contained-html
 
       - name: Stop Appium
         if: always()
@@ -85,3 +78,13 @@ jobs:
           if [ -f appium.pid ]; then
             kill -9 "$(cat appium.pid)" || true
           fi
+
+      - name: Upload artifacts (report, screenshots, logs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-artifacts
+          path: |
+            report.html
+            screenshots/**
+            logs/**
