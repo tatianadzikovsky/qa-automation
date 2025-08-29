@@ -1,43 +1,93 @@
 name: iOS Appium Tests
 
 on:
+  push:
+    branches: [ main ]
   pull_request:
     branches: [ main ]
   workflow_dispatch:
 
+concurrency:
+  group: ios-appium-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  ios-tests:
-    runs-on: macos-latest
+  e2e:
+    runs-on: macos-14
     timeout-minutes: 45
 
     env:
-      IOS_DEVICE: "iPhone 14"
-      IOS_VERSION: "16.4"   # You can adjust to a version GitHub runner supports
+      # You can override these from the Actions UI if you want.
+      IOS_DEVICE: "iPhone 15"         # fallback if a matching device type exists
+      IOS_VERSION: ""                 # leave empty to accept whatever Xcode runtime we create
       APPIUM_SERVER: "http://127.0.0.1:4723/wd/hub"
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
+      - name: Set up Node.js (for Appium)
         uses: actions/setup-node@v4
         with:
-          node-version: "18"
+          node-version: "20"
 
-      - name: Install Appium 3 + XCUITest driver
+      - name: Install Appium + XCUITest driver
+        shell: bash
         run: |
-          npm install -g appium@next
-          appium driver install xcuitest
+          set -euxo pipefail
+          npm -g i appium@^2
+          appium -v
+          # Install the iOS driver (works with Node-only; no Java needed)
+          appium driver install xcuitest@latest
+          appium driver list --installed
 
-      - name: Boot iOS Simulator
+      - name: Boot iOS Simulator (create if needed)
+        shell: bash
         run: |
-          xcrun simctl boot "${IOS_DEVICE}" || true
-          xcrun simctl bootstatus "${IOS_DEVICE}" -b
+          set -euxo pipefail
 
-      - name: Start Appium server
+          echo "== Available device types (before) =="
+          xcrun simctl list devicetypes
+
+          echo "== Available runtimes =="
+          xcrun simctl list runtimes
+
+          # Pick the newest available iOS runtime identifier, e.g. com.apple.CoreSimulator.SimRuntime.iOS-17-5
+          RUNTIME_ID=$(xcrun simctl list runtimes | awk -F '[()]' '/iOS .*available/ {print $2; exit}')
+          echo "Using runtime: $RUNTIME_ID"
+
+          DEVICETYPE="${IOS_DEVICE:-iPhone 15}"
+
+          # If that devicetype isn't present, fall back to the first iPhone devicetype on this runner
+          if ! xcrun simctl list devicetypes | grep -q "$DEVICETYPE"; then
+            DEVICETYPE=$(xcrun simctl list devicetypes | awk -F '[()]' '/iPhone/ {sub(/^ *- /,"",$1); print $1; exit}')
+            echo "Requested device type not found; falling back to: $DEVICETYPE"
+          fi
+
+          # Create a fresh simulator and boot it
+          UDID=$(xcrun simctl create "UITests" "$DEVICETYPE" "$RUNTIME_ID")
+          echo "Created simulator: $UDID ($DEVICETYPE / $RUNTIME_ID)"
+
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+
+          echo "== Devices (after boot) =="
+          xcrun simctl list devices | sed -n '1,200p'
+
+          # Export for later steps (and for Appium caps)
+          echo "IOS_UDID=$UDID" >> "$GITHUB_ENV"
+          echo "IOS_DEVICE=$DEVICETYPE" >> "$GITHUB_ENV"
+
+      - name: Start Appium (background)
+        shell: bash
         run: |
-          nohup appium --base-path /wd/hub > appium.log 2>&1 &
-          sleep 10
+          set -euxo pipefail
+          mkdir -p logs
+          # Use /wd/hub base path to match Python code default
+          nohup appium --base-path /wd/hub --log logs/appium.log >/dev/null 2>&1 &
+          echo $! > appium.pid
+          sleep 5
+          ps -p $(cat appium.pid) || (echo "Appium failed to start" && exit 1)
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -45,10 +95,53 @@ jobs:
           python-version: "3.11"
 
       - name: Install Python deps
+        shell: bash
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install Appium-Python-Client pytest pytest-html
+          set -euxo pipefail
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pytest pytest-html Appium-Python-Client
+          fi
 
-      - name: Run pytest (iOS tests)
-        run: pytest -v -s --html=report.html --self-contained-html tests/
+      - name: Run pytest (iOS)
+        shell: bash
+        env:
+          APPIUM_SERVER: ${{ env.APPIUM_SERVER }}
+          IOS_DEVICE: ${{ env.IOS_DEVICE }}
+          IOS_VERSION: ${{ env.IOS_VERSION }}
+          IOS_UDID: ${{ env.IOS_UDID }}
+        run: |
+          set -euxo pipefail
+          mkdir -p screenshots
+          pytest -v -s --html=report.html --self-contained-html
+
+      - name: Upload test report and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-appium-artifacts
+          path: |
+            report.html
+            logs/appium.log
+            screenshots/**
+
+      - name: Shutdown simulator
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ -n "${IOS_UDID:-}" ]; then
+            xcrun simctl shutdown "$IOS_UDID" || true
+            xcrun simctl erase "$IOS_UDID" || true
+          fi
+
+      - name: Stop Appium
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ -f appium.pid ]; then
+            kill -9 "$(cat appium.pid)" || true
+            rm -f appium.pid
+          fi
