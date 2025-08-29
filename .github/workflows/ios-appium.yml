@@ -1,105 +1,121 @@
-name: iOS Appium Tests (simulator)
+name: iOS Appium Tests
 
 on:
+  push:
+    branches: [ main ]
   pull_request:
     branches: [ main ]
   workflow_dispatch: {}
 
 jobs:
-  e2e-ios:
-    runs-on: macos-14
+  e2e:
+    runs-on: macos-latest   # Xcode is preinstalled on GitHub-hosted macOS
     timeout-minutes: 45
 
     env:
-      IOS_DEVICE: "iPhone 14"              # safe default available on runners
-      IOS_VERSION: ""                      # let simctl pick installed runtime
-      APPIUM_SERVER: "http://127.0.0.1:4723/wd/hub"
+      # adjust if your tests read these
+      APPIUM_HOST: 127.0.0.1
+      APPIUM_PORT: 4723
+      APPIUM_BASE_PATH: /wd/hub
 
     steps:
+      # ---------- Repo & toolchain ----------
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show Xcode & simulators
-        run: |
-          xcodebuild -version
-          echo "== Device Types =="
-          xcrun simctl list devicetypes | sed -n '1,120p'
-          echo "== Runtimes =="
-          xcrun simctl list runtimes | sed -n '1,120p'
-
-      - name: Set up Node & Appium 2
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
-      - name: Install Appium v2 + xcuitest driver
-        run: |
-          npm uninstall -g appium || true
-          npm install -g appium@2.11.0
-          npx appium --version
-          npx appium driver uninstall xcuitest || true
-          npx appium driver install xcuitest
-          npx appium driver list
-
-      - name: Boot iOS Simulator (create if missing)
-        id: sim
-        shell: bash
-        run: |
-          set -e
-          DEV_NAME="${IOS_DEVICE}"
-          # Find an available device matching name (e.g. "iPhone 14")
-          UDID=$(xcrun simctl list devices available | awk -F '[()]' -v name="$DEV_NAME" '$0 ~ name {print $2; exit}')
-          if [ -z "$UDID" ]; then
-            echo "No $DEV_NAME found; creating one..."
-            RUNTIME=$(xcrun simctl list runtimes | awk -F '[()]' '/iOS/ && /available/ {print $2; exit}')
-            TYPE_ID=$(xcrun simctl list devicetypes | awk -F '[()]' -v name="$DEV_NAME" '$0 ~ name {print $2; exit}')
-            xcrun simctl create "CI $DEV_NAME" "$TYPE_ID" "$RUNTIME"
-            UDID=$(xcrun simctl list devices available | awk -F '[()]' '/CI iPhone 14/{print $2; exit}')
-          fi
-          echo "Using UDID: $UDID"
-          echo "udid=$UDID" >> $GITHUB_OUTPUT
-
-          xcrun simctl boot "$UDID" || true
-          xcrun simctl bootstatus "$UDID" -b
-          # quick sanity screenshot
-          xcrun simctl io "$UDID" screenshot bootscreen.png || true
+          node-version: '20'
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
+          cache: 'pip'
 
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install pytest pytest-html Appium-Python-Client selenium
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pytest pytest-html Appium-Python-Client
+          fi
 
+      # ---------- Appium 3 + xcuitest ----------
+      - name: Install Appium 3 (RC) + xcuitest driver
+        run: |
+          npm uninstall -g appium || true
+          npm install -g appium@next
+          appium --version
+          npx appium driver install xcuitest
+          npx appium driver list
+
+      # ---------- iOS Simulator ----------
+      - name: Prepare & boot iOS Simulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Accept Xcode license just in case (no-op if already accepted)
+          sudo xcodebuild -license accept || true
+
+          # Clean up and create a fresh simulator for a stable run
+          xcrun simctl shutdown all || true
+          xcrun simctl erase all || true
+
+          # Pick the latest available iOS runtime
+          RUNTIME_ID=$(xcrun simctl list runtimes | awk -F'[()]' '/iOS .*Available/ {print $2}' | tail -1)
+          echo "Using runtime: $RUNTIME_ID"
+
+          DEVICE_TYPE="iPhone 14"
+          DEVICE_ID=$(xcrun simctl create "ci-iphone" "$DEVICE_TYPE" "$RUNTIME_ID")
+          echo "Created device: $DEVICE_ID"
+
+          # Boot and wait until it's ready
+          xcrun simctl boot "$DEVICE_ID"
+          xcrun simctl bootstatus "$DEVICE_ID" -b
+
+          # Make available to later steps
+          echo "DEVICE_ID=$DEVICE_ID" >> "$GITHUB_ENV"
+
+          # Show for debugging
+          xcrun simctl list devices | sed -n '1,200p'
+
+      # ---------- Start Appium server ----------
       - name: Start Appium (background)
         run: |
-          nohup npx appium --base-path /wd/hub --log appium.log > appium.out 2>&1 &
-          # basic wait for port
+          mkdir -p logs screenshots
+          nohup npx appium --base-path "${APPIUM_BASE_PATH}" --log logs/appium.log > logs/appium.out 2>&1 &
           for i in {1..40}; do
-            nc -z 127.0.0.1 4723 && echo "Appium is up" && break
+            nc -z ${APPIUM_HOST} ${APPIUM_PORT} && echo "Appium is up" && break
             echo "Waiting for Appium ($i)..."; sleep 2
           done
-          nc -z 127.0.0.1 4723 || (echo "Appium failed to start"; tail -n +100 appium.out; exit 1)
+          nc -z ${APPIUM_HOST} ${APPIUM_PORT} || (echo "Appium failed to start"; tail -n +1 logs/appium.out; exit 1)
 
+      # ---------- Run tests ----------
+      # Make sure your tests point to http://127.0.0.1:4723/wd/hub and
+      # use "platformName": "iOS" with a simulator deviceName (e.g., iPhone 14).
       - name: Run pytest (iOS)
         env:
-          APPIUM_SERVER: ${{ env.APPIUM_SERVER }}
-          IOS_DEVICE: ${{ env.IOS_DEVICE }}
-          IOS_VERSION: ${{ env.IOS_VERSION }}
+          APPIUM_SERVER_URL: http://${{ env.APPIUM_HOST }}:${{ env.APPIUM_PORT }}${{ env.APPIUM_BASE_PATH }}
+          IOS_SIMULATOR_UDID: ${{ env.DEVICE_ID }}
         run: |
-          mkdir -p screenshots
-          pytest -v -s tests_ios --html=report_ios.html --self-contained-html
+          set -e
+          echo "APPIUM_SERVER_URL=$APPIUM_SERVER_URL"
+          echo "IOS_SIMULATOR_UDID=$IOS_SIMULATOR_UDID"
+          # If your tests accept env vars, they can read APPIUM_SERVER_URL / IOS_SIMULATOR_UDID.
+          # Adjust the test path below to your iOS smoke test(s).
+          pytest -v -s tests --html=report.html --self-contained-html
 
-      - name: Upload artifacts
+      # ---------- Upload artifacts ----------
+      - name: Upload test report and screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ios-appium-artifacts
+          # Collect common outputs; add more if you produce them
           path: |
-            report_ios.html
-            appium.log
-            appium.out
-            bootscreen.png
+            report.html
+            screenshots/**
+            logs/**
