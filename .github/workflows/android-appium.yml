@@ -1,16 +1,17 @@
 name: Android Appium Tests
 
 on:
-  push:
-    branches: [ main ]
   pull_request:
     branches: [ main ]
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 jobs:
   e2e:
     runs-on: macos-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
+    env:
+      ANDROID_SDK_ROOT: ${{ env.ANDROID_HOME }}
+      ANDROID_HOME: ${{ env.ANDROID_HOME }}
 
     steps:
       - name: Checkout
@@ -20,71 +21,94 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '18'
-
-      - name: Install Appium & drivers
-        run: |
-          npm i -g appium@latest wait-on
-          appium -v
-          appium driver install uiautomator2
+          java-version: "17"
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.11"
 
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pytest pytest-html
 
-      - name: Prepare artifact folders
-        run: mkdir -p screenshots logs
-
-      # Boots emulator, then runs whatever script we provide
-      - name: Launch emulator and run tests
-        uses: reactivecircus/android-emulator-runner@v2
+      - name: Set up Node & Appium (v2) + uiautomator2 (v2)
+        uses: actions/setup-node@v4
         with:
-          api-level: 30
-          target: default
-          arch: x86_64
-          profile: pixel_5
-          emulator-options: -no-window -noaudio -no-boot-anim
-          disable-animations: true
-          script: |
-            adb devices
-            adb wait-for-device
-            # speed up UI
-            adb shell settings put global window_animation_scale 0
-            adb shell settings put global transition_animation_scale 0
-            adb shell settings put global animator_duration_scale 0
-
-            # Start Appium in background and wait for the port
-            appium --allow-cors --log logs/appium.log > logs/appium.console.log 2>&1 &
-            echo $! > appium.pid
-            wait-on tcp:4723 -t 60000
-
-            # Run tests
-            pytest -v -s tests/ --html=report.html --self-contained-html
-
-      - name: Stop Appium
-        if: always()
+          node-version: "20"
+      - name: Install Appium & driver
         run: |
-          if [ -f appium.pid ]; then
-            kill -9 "$(cat appium.pid)" || true
-          fi
+          npm i -g appium@2.12.1
+          appium -v
+          # Install a driver version compatible with Appium v2
+          appium driver install --source=npm appium-uiautomator2-driver@2.36.3
+          appium driver list
 
-      - name: Upload artifacts (report, screenshots, logs)
+      - name: Install Android SDK components (API 34 image)
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses > /dev/null
+          sdkmanager "platform-tools" "emulator" \
+                     "platforms;android-34" \
+                     "system-images;android-34;google_apis;x86_64"
+
+      - name: Create AVD
+        shell: bash
+        run: |
+          echo "no" | avdmanager create avd -n ciApi34 \
+            -k "system-images;android-34;google_apis;x86_64" \
+            --device "pixel_5" --force
+          avdmanager list avd
+
+      - name: Boot emulator (headless) and wait
+        shell: bash
+        run: |
+          mkdir -p logs screenshots
+          nohup $ANDROID_HOME/emulator/emulator -avd ciApi34 \
+            -no-window -gpu swiftshader_indirect \
+            -no-snapshot -no-boot-anim -noaudio \
+            -camera-back none -camera-front none \
+            > logs/emulator.out 2>&1 &
+
+          adb start-server
+          # Show devices while waiting helps debugging
+          echo "Waiting for emulator to appear..."
+          timeout 600 bash -c 'until adb devices | grep -m 1 "emulator-"; do sleep 2; adb devices; done'
+
+          echo "Waiting for sys.boot_completed..."
+          timeout 600 bash -c 'until adb -e shell getprop sys.boot_completed 2>/dev/null | grep -m 1 "1"; do sleep 3; adb -e shell getprop sys.boot_completed || true; done'
+
+          # Dismiss keyguard just in case
+          adb -e shell settings put global hidden_api_policy 1 || true
+          adb -e shell wm dismiss-keyguard || true
+          adb -e shell input keyevent 82 || true
+
+      - name: Start Appium (background)
+        shell: bash
+        run: |
+          nohup appium --base-path /wd/hub --log logs/appium.log > logs/appium.out 2>&1 &
+          echo $! > appium.pid
+
+      - name: Run tests
+        env:
+          APPIUM_SERVER: http://127.0.0.1:4723/wd/hub
+        run: |
+          pytest -v -s tests/test_ci_smoke.py \
+            --html=report.html --self-contained-html
+
+      - name: Upload artifacts (report + screenshots + logs)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-artifacts
+          name: android-pytest-report
           path: |
             report.html
             screenshots/**
             logs/**
+
+      - name: Stop Appium
+        if: always()
+        run: |
+          if [ -f appium.pid ]; then kill -9 "$(cat appium.pid)" || true; fi
