@@ -1,53 +1,92 @@
-from appium.webdriver.common.appiumby import AppiumBy
-from selenium.common.exceptions import TimeoutException
-from selenium.webdriver.support.ui import WebDriverWait
+# pages/network_page.py
+import time
+from selenium.webdriver.common.by import By
+from .base_page import BasePage, DEFAULT_TIMEOUT
 
-class NetworkPage:
-    def __init__(self, driver):
-        self.driver = driver
+class NetworkPage(BasePage):
+    TITLE = (By.ID, "com.android.settings:id/action_bar")
 
-    # texts that can appear across Android builds
-    _TITLE_TEXTS = ["Network & internet", "Internet", "Connections", "Network"]
+    WIFI_SWITCH_IDS = [
+        "com.android.settings:id/switch_widget",
+        "android:id/switch_widget",
+        "com.android.systemui:id/switch_text",
+    ]
 
-    def wait_loaded(self, timeout: int = 8):
-        """Wait until activity or any title text indicates we're on the Network screen."""
-        def ready(d):
-            act = (d.current_activity or "")
-            if "Network" in act or "network" in act:
-                return True
-            for text in self._TITLE_TEXTS:
-                if d.find_elements(
-                    AppiumBy.ANDROID_UIAUTOMATOR,
-                    f'new UiSelector().textContains("{text}")'
-                ):
-                    return True
-            return False
+    WIFI_STATUS_TEXT_IDS = [
+        "com.android.settings:id/switch_text",
+        "com.android.settings:id/summary_container",
+    ]
 
+    def wait_loaded(self):
+        # minimal wait to ensure page is present
         try:
-            WebDriverWait(self.driver, timeout).until(ready)
-        except TimeoutException:
-            pass  # we’ll let is_here() decide
-
+            self.wait_visible(self.TITLE, timeout=DEFAULT_TIMEOUT)
+        except Exception:
+            pass
         return self
 
     def is_here(self) -> bool:
-        act = (self.driver.current_activity or "")
-        if "Network" in act or "network" in act:
+        try:
+            self.wait_visible(self.TITLE, timeout=DEFAULT_TIMEOUT)
             return True
-        for text in self._TITLE_TEXTS:
-            if self.driver.find_elements(
-                AppiumBy.ANDROID_UIAUTOMATOR,
-                f'new UiSelector().textContains("{text}")'
-            ):
-                return True
-        return False
+        except Exception:
+            return False
 
-    def toggle_first_switch(self) -> bool:
-        switches = self.driver.find_elements(AppiumBy.CLASS_NAME, "android.widget.Switch")
-        if switches:
-            switches[0].click()
+    # ---------- helpers ----------
+    def _find_wifi_switch(self):
+        for rid in self.WIFI_SWITCH_IDS:
+            els = self.driver.find_elements(By.ID, rid)
+            for el in els:
+                if el.is_displayed():
+                    return el
+        # Fallback: a Switch next to text “Wi-Fi”
+        cand = self.driver.find_elements(
+            By.XPATH, "//*[@text='Wi-Fi' or @text='Wi-Fi']/following::*[@class='android.widget.Switch'][1]"
+        )
+        return cand[0] if cand else None
+
+    def _read_wifi_state_text(self) -> str:
+        for rid in self.WIFI_STATUS_TEXT_IDS:
+            els = self.driver.find_elements(By.ID, rid)
+            for el in els:
+                if el.is_displayed():
+                    txt = (el.text or "").strip().lower()
+                    if txt:
+                        return txt
+        sw = self._find_wifi_switch()
+        if sw is not None:
+            checked = sw.get_attribute("checked")
+            return "on" if str(checked).lower() == "true" else "off"
+        return ""
+
+    # ---------- PUBLIC API used by tests ----------
+    def wifi_is_on(self) -> bool:
+        txt = self._read_wifi_state_text()
+        if "on" in txt:
             return True
-        return False
+        if "off" in txt:
+            return False
+        sw = self._find_wifi_switch()
+        if sw is None:
+            return False
+        return str(sw.get_attribute("checked")).lower() == "true"
 
-    def screenshot(self, path: str):
-        self.driver.save_screenshot(path)
+    def wifi_is_off(self) -> bool:
+        return not self.wifi_is_on()
+
+    def toggle_wifi(self):
+        sw = self._find_wifi_switch()
+        if sw is None:
+            # last resort: tap the row that contains Wi-Fi text
+            row = self.driver.find_elements(
+                By.XPATH, "//*[contains(@text,'Wi-Fi') or contains(@text,'Wi-Fi')]"
+            )
+            if row:
+                row[0].click()
+            else:
+                raise AssertionError("Wi-Fi toggle not found")
+        else:
+            sw.click()
+        time.sleep(1)
+        return True
+

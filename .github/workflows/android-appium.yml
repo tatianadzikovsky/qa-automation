@@ -1,80 +1,114 @@
 name: Android Appium Tests
 
 on:
-  push:
-    branches: [ main ]
   pull_request:
     branches: [ main ]
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 jobs:
   e2e:
     runs-on: macos-latest
     timeout-minutes: 45
+    env:
+      ANDROID_SDK_ROOT: ${{ env.ANDROID_HOME }}
+      ANDROID_HOME: ${{ env.ANDROID_HOME }}
 
     steps:
-      # 1) Checkout your repo
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2) Java for Android tools
       - name: Set up Java (JDK 17)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      # 3) Python for pytest
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.11"
 
-      # 4) Node.js to install Appium
-      - name: Set up Node.js
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pytest pytest-html
+
+      - name: Set up Node & Appium (v2) + uiautomator2 (v2)
         uses: actions/setup-node@v4
         with:
-          node-version: "18"
-
-      # 5) Install Appium + Python deps
-      - name: Install dependencies
+          node-version: "20"
+      - name: Install Appium & driver
         run: |
-          npm install -g appium
-          appium driver install uiautomator2
+          npm i -g appium@2.12.1
+          appium -v
+          # Install a driver version compatible with Appium v2
+          appium driver install --source=npm appium-uiautomator2-driver@2.36.3
+          appium driver list
 
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+      - name: Install Android SDK components (API 34 image)
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses > /dev/null
+          sdkmanager "platform-tools" "emulator" \
+                     "platforms;android-34" \
+                     "system-images;android-34;google_apis;x86_64"
 
-      # 6) Boot an Android emulator and run tests inside it
-      - name: Run on Android emulator
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: 34
-          target: google_apis
-          arch: x86_64
-          profile: pixel_5
-          disable-animations: true
-          script: |
-            mkdir -p logs screenshots
+      - name: Create AVD
+        shell: bash
+        run: |
+          echo "no" | avdmanager create avd -n ciApi34 \
+            -k "system-images;android-34;google_apis;x86_64" \
+            --device "pixel_5" --force
+          avdmanager list avd
 
-            # start Appium in background (no base path because your tests use http://127.0.0.1:4723)
-            appium --log logs/appium.log &
-            APPIUM_PID=$!
+      - name: Boot emulator (headless) and wait
+        shell: bash
+        run: |
+          mkdir -p logs screenshots
+          nohup $ANDROID_HOME/emulator/emulator -avd ciApi34 \
+            -no-window -gpu swiftshader_indirect \
+            -no-snapshot -no-boot-anim -noaudio \
+            -camera-back none -camera-front none \
+            > logs/emulator.out 2>&1 &
 
-            # run only the mobile tests (adjust the -k filter if you want)
-            pytest -v -s -k "appium or settings" --html=report.html --self-contained-html
+          adb start-server
+          # Show devices while waiting helps debugging
+          echo "Waiting for emulator to appear..."
+          timeout 600 bash -c 'until adb devices | grep -m 1 "emulator-"; do sleep 2; adb devices; done'
 
-            # stop Appium
-            kill -9 $APPIUM_PID || true
+          echo "Waiting for sys.boot_completed..."
+          timeout 600 bash -c 'until adb -e shell getprop sys.boot_completed 2>/dev/null | grep -m 1 "1"; do sleep 3; adb -e shell getprop sys.boot_completed || true; done'
 
-      # 7) Upload report + screenshots no matter what
-      - name: Upload test report and screenshots
+          # Dismiss keyguard just in case
+          adb -e shell settings put global hidden_api_policy 1 || true
+          adb -e shell wm dismiss-keyguard || true
+          adb -e shell input keyevent 82 || true
+
+      - name: Start Appium (background)
+        shell: bash
+        run: |
+          nohup appium --base-path /wd/hub --log logs/appium.log > logs/appium.out 2>&1 &
+          echo $! > appium.pid
+
+      - name: Run tests
+        env:
+          APPIUM_SERVER: http://127.0.0.1:4723/wd/hub
+        run: |
+          pytest -v -s tests/test_ci_smoke.py \
+            --html=report.html --self-contained-html
+
+      - name: Upload artifacts (report + screenshots + logs)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pytest-report
+          name: android-pytest-report
           path: |
             report.html
             screenshots/**
-            logs/appium.log
+            logs/**
 
+      - name: Stop Appium
+        if: always()
+        run: |
+          if [ -f appium.pid ]; then kill -9 "$(cat appium.pid)" || true; fi
