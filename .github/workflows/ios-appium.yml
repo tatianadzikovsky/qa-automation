@@ -1,117 +1,138 @@
 name: iOS Appium Tests
 
 on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/ios-appium.yml"
+      - "tests_ios/**"
+      - "pages/**"
+      - "requirements.txt"
+      - "pytest.ini"
   pull_request:
-  workflow_dispatch:
+    branches: [ main ]
+    paths:
+      - "tests_ios/**"
+      - "pages/**"
+      - "requirements.txt"
+      - "pytest.ini"
 
 jobs:
   e2e-ios:
-    runs-on: macos-14
-    timeout-minutes: 30
+    runs-on: macos-latest  # Apple Silicon macOS runner
+
+    env:
+      IOS_RUNTIME: "iOS 18.6"
+      IOS_DEVICE_TYPE: "iPhone 16"
+      IOS_DEVICE_NAME: "CI Phone"
+      # Your tests commonly read this:
+      APPIUM_SERVER: "http://127.0.0.1:4723/wd/hub"
+      # Optional for your tests to read:
+      IOS_DEVICE: "iPhone 16"
+      IOS_VERSION: "18.6"
 
     steps:
+      # 1) Checkout repo
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show Xcode and Simulators (for debugging)
+      # (Optional) show installed runtimes (good for debugging)
+      - name: Show Xcode / Simulator Runtimes
         run: |
           xcodebuild -version
-          echo "---- Device Types ----"
-          xcrun simctl list devicetypes
-          echo "---- Runtimes ----"
           xcrun simctl list runtimes
+          xcrun simctl list devicetypes
 
-      - name: Set up Node
+      # 2) Set up Node (for Appium)
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
 
+      # 3) Install Appium 2 and xcuitest driver
       - name: Install Appium 2 + xcuitest driver
         run: |
-          npm i -g appium@next
+          npm -g i appium@^2
+          appium -v
+          # Install (or update) xcuitest driver
           appium driver install xcuitest
-          appium --version
-          appium driver list
+          appium driver list --installed
 
-      # ************ THIS REPLACES THE HARDCODED 'iOS 18.6' ************
-      - name: Boot iOS Simulator (auto-detect runtime)
+      # 4) Boot iOS Simulator (create if missing, then boot)
+      - name: Boot iOS Simulator
         shell: bash
         run: |
           set -euo pipefail
 
-          # Pick the latest available iOS runtime identifier (e.g. com.apple.CoreSimulator.SimRuntime.iOS-18-5)
-          RUNTIME_ID=$(xcrun simctl list runtimes -j | /usr/bin/python3 - <<'PY'
-import json, sys
-data = json.load(sys.stdin)
-ios = []
-for r in data["runtimes"]:
-    ident = r.get("identifier","")
-    if ident.startswith("com.apple.CoreSimulator.SimRuntime.iOS"):
-        # macOS runners sometimes expose 'isAvailable' or '(available)'
-        if r.get("isAvailable") or r.get("availability") == "(available)":
-            ios.append((r["version"], ident))
-ios.sort(key=lambda x: tuple(map(int, x[0].split("."))))
-print(ios[-1][1])
-PY
-)
-          echo "Using runtime: $RUNTIME_ID"
+          # Find existing device UDID by name (if any)
+          EXISTING_UDID="$(xcrun simctl list devices | awk -v n="${IOS_DEVICE_NAME}" -F'[()]' '$0 ~ n" \\(" {print $2; exit}')"
 
-          # Choose a known device type, falling back as needed.
-          DEVICETYPE=$(
-            xcrun simctl list devicetypes | awk -F'[()]' '
-              /iPhone 16 Pro Max$/ {print $2; exit}
-              /iPhone 16 Pro$/     {print $2; exit}
-              /iPhone 16$/         {print $2; exit}
-              /iPhone 15 Pro$/     {print $2; exit}
-              /iPhone 15$/         {print $2; exit}
-              /iPhone 14$/         {print $2; exit}
-              /iPhone SE \(3rd generation\)$/ {print $2; exit}
-            '
-          )
-          echo "Using device type: $DEVICETYPE"
+          if [[ -z "${EXISTING_UDID}" ]]; then
+            echo "Creating simulator: ${IOS_DEVICE_NAME} (${IOS_DEVICE_TYPE} / ${IOS_RUNTIME})"
+            UDID="$(xcrun simctl create "${IOS_DEVICE_NAME}" "${IOS_DEVICE_TYPE}" "${IOS_RUNTIME}")"
+          else
+            echo "Reusing existing simulator UDID: ${EXISTING_UDID}"
+            UDID="${EXISTING_UDID}"
+          fi
 
-          # Create & boot simulator
-          UDID=$(xcrun simctl create "CI Phone" "$DEVICETYPE" "$RUNTIME_ID")
-          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          echo "Booting simulator ${UDID}…"
+          xcrun simctl boot "${UDID}" || true
+          xcrun simctl bootstatus "${UDID}" -b
 
-          xcrun simctl boot "$UDID"
-          # Wait until fully booted
-          xcrun simctl bootstatus "$UDID" -b
+          # Cosmetic: make screenshots deterministic
+          xcrun simctl status_bar "${UDID}" override --time "9:41" || true
 
-          # Cosmetic: set status bar, take a screenshot (non-fatal)
-          xcrun simctl status_bar "$UDID" override --time "9:41" || true
-          xcrun simctl io "$UDID" screenshot boot.png || true
+          # Export for later steps (Appium / tests)
+          {
+            echo "UDID=${UDID}"
+            echo "IOS_DEVICE=${IOS_DEVICE_TYPE}"
+            echo "IOS_VERSION=${IOS_RUNTIME#iOS }"
+          } >> "$GITHUB_ENV"
 
+      # 5) Set up Python
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
+      # 6) Install Python deps
       - name: Install Python deps
         run: |
-          python -m pip install -U pip
-          pip install -r requirements.txt
-          # Ensure pytest-html is there if you use --html:
-          pip install pytest-html
+          python -m pip install --upgrade pip
+          if [[ -f requirements.txt ]]; then
+            pip install -r requirements.txt
+          else
+            pip install pytest pytest-html Appium-Python-Client
+          fi
 
+      # 7) Start Appium (background)
       - name: Start Appium server (background)
         run: |
-          nohup appium > appium.log 2>&1 &
+          nohup appium --base-path /wd/hub --log-level error > appium.log 2>&1 &
+          # Make sure server is answering before moving on
+          for i in {1..30}; do
+            if curl -s http://127.0.0.1:4723/wd/hub/status | grep -q '"ready":'; then
+              echo "Appium is ready."
+              break
+            fi
+            sleep 1
+          done
+          curl -s http://127.0.0.1:4723/wd/hub/status || true
 
+      # 8) Run tests (HTML report)
       - name: Run pytest (iOS)
-        env:
-          APPIUM_SERVER: http://127.0.0.1:4723
-          IOS_DEVICE: CI Phone
         run: |
-          # Keep arguments that match your local run; remove unsupported ones
-          pytest -v -s tests_ios --maxfail=1 \
-                 --html=report_ios.html --self-contained-html
+          mkdir -p screenshots
+          pytest -v -s tests_ios --html=report_ios.html --self-contained-html
 
+      # 9) Upload artifacts (report + screenshots + appium log)
       - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ios-artifacts
+          name: ios-test-artifacts
           path: |
             report_ios.html
-            appium.log
             screenshots/**
+            appium.log
+          if-no-files-found: ignore
