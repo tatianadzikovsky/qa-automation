@@ -1,9 +1,13 @@
-pytest==8.4.1
-pytest-html==4.1.1
-Appium-Python-Client
-selenium
+# Core testing framework
+pytest==7.4.4
 
-Appium-Python-Client
-selenium
-pytest
-pytest-html
+# Pytest plugins
+pytest-html==4.1.1
+pytest-timeout==2.3.1
+pytest-rerunfailures==13.0
+
+# Appium client
+Appium-Python-Client==3.2.1
+
+# Selenium (Appium depends on it)
+selenium==4.21.0
